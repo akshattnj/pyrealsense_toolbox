@@ -1,0 +1,147 @@
+import pyrealsense2 as rs
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import cv2
+import numpy as np
+import scipy.signal as signal
+from collections import deque
+import joblib
+import os
+
+# --- 1. SETUP & CONFIG ---
+FPS = 30
+MAX_WINDOW = FPS * 60  # 60s Sliding Window
+CALIB_FILE = "pulse_model.pkl"
+
+# Landmarks for sampling: Forehead center, Left/Right Forehead, both Cheeks
+TARGET_LANDMARKS = [151, 108, 337, 118, 347] 
+
+# Buffers
+hue_grid_buffer = deque(maxlen=MAX_WINDOW)
+bpm_history = deque(maxlen=10)
+
+# --- 2. PERSONALIZED MODEL LOGIC ---
+class CalibrationModel:
+    def __init__(self):
+        if os.path.exists(CALIB_FILE):
+            self.model = joblib.load(CALIB_FILE)
+            self.ready = True
+        else:
+            self.model = {"offset": 1.0, "bias": 0.0}
+            self.ready = False
+
+    def train(self, measured, actual):
+        # Simple linear correction: Actual = (Measured * Offset) + Bias
+        # Over time, you could upgrade this to a Scikit-Learn Regressor
+        self.model["offset"] = actual / measured
+        joblib.dump(self.model, CALIB_FILE)
+        self.ready = True
+
+    def predict(self, val):
+        return val * self.model["offset"]
+
+calib = CalibrationModel()
+
+# --- 3. VISION & SENSOR SETUP ---
+base_options = python.BaseOptions(model_asset_path='face_landmarker.task')
+options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
+landmarker = vision.FaceLandmarker.create_from_options(options)
+
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, FPS)
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, FPS)
+profile = pipeline.start(config)
+
+# Hardware Locks
+color_sensor = profile.get_device().query_sensors()[1]
+color_sensor.set_option(rs.option.enable_auto_white_balance, False)
+color_sensor.set_option(rs.option.enable_auto_exposure, False)
+
+def process_multi_point(rgb_img, depth_frame, result):
+    if not result.face_landmarks: return None
+    
+    h, w, _ = rgb_img.shape
+    point_hues = []
+    
+    for idx in TARGET_LANDMARKS:
+        lm = result.face_landmarks[0][idx]
+        cx, cy = int(lm.x * w), int(lm.y * h)
+        
+        # Spatial-Temporal Correction using Depth
+        dist = depth_frame.get_distance(cx, cy)
+        if dist == 0: continue # Skip invalid depth
+        
+        # Adaptive ROI: Smaller if you're close, larger if far
+        # This keeps the 'physical' area sampled consistent
+        r = max(2, int(15 / (dist + 0.5))) 
+        
+        roi = rgb_img[max(0,cy-r):cy+r, max(0,cx-r):cx+r]
+        if roi.size > 0:
+            # Multi-point average within the patch
+            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+            # Use distance to normalize light intensity (Inverse Square Law)
+            norm_hue = np.mean(hsv_roi[:, :, 0]) * (dist ** 2)
+            point_hues.append(norm_hue)
+            
+            # Visual feedback for the grid
+            cv2.circle(rgb_img, (cx, cy), r, (0, 255, 0), 1)
+
+    return np.mean(point_hues) if point_hues else None
+
+# --- 4. EXECUTION LOOP ---
+mode = "normal" # Switch to "train" to calibrate
+print(f"System Running in {mode.upper()} mode.")
+
+try:
+    while True:
+        frames = pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        depth_frame = frames.get_depth_frame()
+        if not color_frame or not depth_frame: continue
+
+        img = np.asanyarray(color_frame.get_data())
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        
+        # Detection
+        detection = landmarker.detect(mp_image)
+        avg_val = process_multi_point(img, depth_frame, detection)
+        
+        if avg_val:
+            hue_grid_buffer.append(avg_val)
+
+        # Signal Processing
+        if len(hue_grid_buffer) >= (FPS * 25): # Minimum window to start
+            sig = signal.detrend(np.array(hue_grid_buffer))
+            b, a = signal.butter(4, [0.75/(FPS/2), 2.5/(FPS/2)], btype='band')
+            filtered = signal.filtfilt(b, a, sig)
+            
+            freqs, psd = signal.periodogram(filtered, fs=FPS, nfft=4096)
+            raw_bpm = freqs[np.argmax(psd)] * 60
+            
+            # Application of Personalized Model
+            final_bpm = calib.predict(raw_bpm)
+            bpm_history.append(final_bpm)
+            stable_bpm = np.median(bpm_history)
+
+            # Training Trigger
+            if mode == "train" and cv2.waitKey(1) & 0xFF == ord('t'):
+                actual_hr = 78 # Example manual entry
+                calib.train(raw_bpm, actual_hr)
+                print(f"Calibrated to {actual_hr}!")
+
+            # UI
+            color = (0, 255, 0) if calib.ready else (0, 165, 255)
+            cv2.putText(img, f"BPM: {stable_bpm:.1f}", (40, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
+            status = "Model Active" if calib.ready else "Uncalibrated"
+            cv2.putText(img, status, (40, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        cv2.imshow("rPPG Pro: Depth-Aware Multi-Point", img)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+finally:
+    pipeline.stop()
+    cv2.destroyAllWindows()
